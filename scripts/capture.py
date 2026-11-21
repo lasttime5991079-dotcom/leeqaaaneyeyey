@@ -1,9 +1,9 @@
 
 #!/usr/bin/env python3
-"""Authorized browser-page capture to OBS and a selected OK.ru stream.
+"""Original authorized webpage -> Chrome -> OBS -> selected OK.ru stream.
 
-The input is an ordinary webpage URL. This program does not extract HLS
-playlists, bypass DRM, authenticate to websites, or circumvent access controls.
+WARP ON uses Cloudflare's *local proxy for Chrome only*; OBS and GitHub
+network traffic are not proxied. Never bypasses DRM or website restrictions.
 """
 
 import json
@@ -17,8 +17,8 @@ from urllib.parse import urlparse
 
 import obsws_python as obs
 
-# IMPORTANT: These are LIVE PUBLISHING CREDENTIALS. Keep the repository PRIVATE.
-# Replace / rotate these values if your keys have been exposed.
+# User-requested hardcoded OK.ru publishing keys.
+# SECURITY: GitHub repository must be PRIVATE. Rotate keys if exposed.
 OKRU_KEYS = {
     "s2.1": "14204490948143_14846603495983_kzevn36tii",
     "s2.2": "14204506742319_14846634494511_ta2rxyg2oy",
@@ -32,442 +32,308 @@ OKRU_KEYS = {
     "s2.10": "14206184136239_14849618610735_ihnbx7hkoi",
 }
 
-# Example endpoint only. Confirm the RTMP server in your OK.ru account.
-EXAMPLE_OKRU_SERVER = "rtmp://vsu.mycdn.me/input"
-
 ROOT = Path(__file__).resolve().parents[1]
-DIAGNOSTICS = ROOT / "diagnostics"
+DIAG = ROOT / "diagnostics"
 DISPLAY = ":99"
-SCENE = "Authorized Webpage"
-SCREEN = "Chrome Screen"
-AUDIO = "Chrome Audio"
+SCENE = "Webpage Capture"
+SCREEN = "Browser Display"
+AUDIO = "Browser Audio"
 
 
-def run(args, *, check=True, **kwargs):
+def log(message):
+    print(message, flush=True)
+
+
+def execute(args, *, check=True, **kwargs):
     return subprocess.run(args, check=check, **kwargs)
 
 
-def bg(args, log_name, **kwargs):
-    with (DIAGNOSTICS / log_name).open("w", encoding="utf-8") as log:
-        return subprocess.Popen(
-            args, stdout=log, stderr=subprocess.STDOUT, **kwargs
-        )
+def spawn(args, log_name, **kwargs):
+    with (DIAG / log_name).open("w", encoding="utf-8") as fd:
+        return subprocess.Popen(args, stdout=fd, stderr=subprocess.STDOUT, **kwargs)
 
 
-def wait_for(condition, name, timeout=30):
+def wait_until(check, label, timeout=30):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if condition():
+        if check():
             return
         time.sleep(0.5)
-    raise RuntimeError(f"Timed out waiting for {name}; review diagnostics")
+    raise RuntimeError(f"Timeout waiting for {label}")
 
 
-def input_config():
+def show_log(name, last=75):
+    path = DIAG / name
+    if path.exists():
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        log(f"----- Last {min(last, len(lines))} lines of {name} -----")
+        for line in lines[-last:]:
+            # No RTMP URL or publishing secret is printed by this script.
+            # The full diagnostic artifact is sensitive; keep repo private.
+            for key in OKRU_KEYS.values():
+                line = line.replace(key, "[REDACTED_OKRU_KEY]")
+            log(line)
+
+
+def config():
     url = os.getenv("PAGE_URL", "").strip()
     parsed = urlparse(url)
-
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        raise ValueError("PAGE_URL must be a full http:// or https:// webpage URL")
-
+    if parsed.scheme not in ("https", "http") or not parsed.hostname:
+        raise ValueError("page_url must be a complete http(s) webpage URL")
     if parsed.path.lower().endswith((".m3u8", ".mpd")):
-        raise ValueError("Use the original webpage URL, not a playlist URL")
-
-    mode = os.getenv("CAPTURE_MODE", "preview").strip()
+        raise ValueError("Use original webpage URL, not a video playlist")
+    mode = os.getenv("CAPTURE_MODE", "preview").strip().lower()
     if mode not in ("preview", "stream"):
-        raise ValueError("CAPTURE_MODE must be preview or stream")
-
+        raise ValueError("mode must be preview or stream")
     slot = os.getenv("OK_STREAM_SLOT", "s2.1").strip()
     if slot not in OKRU_KEYS:
-        raise ValueError(
-            f"Unknown OK.ru slot {slot!r}; choose s2.1 ... s2.10"
-        )
-
-    minutes = int(os.getenv("CAPTURE_MINUTES", "15"))
-    if not 1 <= minutes <= 300:
-        raise ValueError("CAPTURE_MINUTES must be 1 through 300")
-
-    server = os.getenv(
-        "OK_RTMP_SERVER", EXAMPLE_OKRU_SERVER
-    ).strip().rstrip("/")
-
+        raise ValueError("Select s2.1 through s2.10")
+    hours = int(os.getenv("CAPTURE_HOURS", "1"))
+    minutes = int(os.getenv("CAPTURE_EXTRA_MINUTES", "20"))
+    if hours < 0 or hours > 5 or minutes < 0 or minutes > 59:
+        raise ValueError("hours must be 0-5; minutes must be 0-59")
+    duration = 60 * hours + minutes
+    if mode == "stream" and not 1 <= duration <= 300:
+        raise ValueError("Total stream duration must be 1-300 minutes")
+    warp = os.getenv("CLOUDFLARE_WARP", "off").strip().lower()
+    if warp not in ("on", "off"):
+        raise ValueError("cloudflare_warp must be on or off")
+    server = os.getenv("OK_RTMP_SERVER", "").strip()
     if mode == "stream":
-        endpoint = urlparse(server)
-        if endpoint.scheme not in ("rtmp", "rtmps") or not endpoint.netloc:
-            raise ValueError(
-                "OK_RTMP_SERVER must be the RTMP(S) server URL from OK.ru"
-            )
-
-    print(
-        f"Mode: {mode}; OK.ru slot: {slot}; page hostname: {parsed.hostname}",
-        flush=True,
-    )
-    print(
-        "NOTE: A launched browser is not proof that protected content plays.",
-        flush=True,
-    )
-    return url, mode, slot, minutes, server
+        dest = urlparse(server)
+        if dest.scheme not in ("rtmp", "rtmps") or not dest.hostname:
+            raise ValueError("Set OK.ru RTMP(S) server URL in workflow input")
+    log(f"Webpage host={parsed.hostname}, mode={mode}, OK.ru slot={slot}")
+    log(f"Duration={hours}h {minutes}m ({duration} total minutes), WARP={warp}")
+    return url, mode, slot, duration, warp, server
 
 
-def start_display():
+def linux_desktop():
     os.environ["DISPLAY"] = DISPLAY
-
-    bg(
-        ["Xvfb", DISPLAY, "-screen", "0", "1280x720x24", "-nolisten", "tcp"],
-        "xvfb.log",
-    )
-
-    wait_for(
-        lambda: run(
-            ["xdpyinfo", "-display", DISPLAY],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        ).returncode == 0,
-        "Xvfb",
-    )
-
-    bg(["openbox", "--sm-disable"], "openbox.log")
-    run(["pulseaudio", "--start", "--exit-idle-time=-1"], check=False)
-
-    wait_for(
-        lambda: run(
-            ["pactl", "info"],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        ).returncode == 0,
-        "PulseAudio",
-    )
-
-    sinks = run(
-        ["pactl", "list", "short", "sinks"],
-        capture_output=True,
-        text=True,
-    ).stdout
-
+    os.environ["QT_QPA_PLATFORM"] = "xcb"
+    os.environ["LIBGL_ALWAYS_SOFTWARE"] = "1"
+    os.environ["QT_X11_NO_MITSHM"] = "1"
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp/obs-github-runtime")
+    runtime.mkdir(parents=True, exist_ok=True)
+    runtime.chmod(0o700)
+    os.environ["XDG_RUNTIME_DIR"] = str(runtime)
+    spawn(["Xvfb", DISPLAY, "-screen", "0", "1280x720x24", "+extension", "GLX",
+           "+render", "-noreset", "-nolisten", "tcp"], "xvfb.log")
+    wait_until(lambda: execute(["xdpyinfo", "-display", DISPLAY], check=False,
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL).returncode == 0, "Xvfb")
+    spawn(["openbox", "--sm-disable"], "openbox.log")
+    info = execute(["glxinfo", "-B"], check=False, capture_output=True, text=True)
+    (DIAG / "graphics.txt").write_text(info.stdout + info.stderr, encoding="utf-8")
+    if info.returncode != 0:
+        log("WARNING: glxinfo failed; OBS may lack working OpenGL support")
+    execute(["pulseaudio", "--start", "--exit-idle-time=-1"], check=False)
+    wait_until(lambda: execute(["pactl", "info"], check=False,
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL).returncode == 0, "PulseAudio")
+    sinks = execute(["pactl", "list", "short", "sinks"],
+                    capture_output=True, text=True).stdout
     if "browser_audio" not in sinks:
-        run(
-            [
-                "pactl",
-                "load-module",
-                "module-null-sink",
-                "sink_name=browser_audio",
-                "sink_properties=device.description=BrowserAudio",
-            ]
-        )
-
-    run(["pactl", "set-default-sink", "browser_audio"])
-    print(
-        "Xvfb display and PulseAudio browser_audio.monitor initialized",
-        flush=True,
-    )
+        execute(["pactl", "load-module", "module-null-sink", "sink_name=browser_audio",
+                 "sink_properties=device.description=BrowserAudio"])
+    execute(["pactl", "set-default-sink", "browser_audio"])
+    log("Xvfb, Openbox, and PulseAudio initialized")
 
 
-def obs_proc():
-    return bg(
-        ["obs", "--disable-updater", "--disable-shutdown-check"],
-        "obs.log",
-    )
-
-
-def start_obs():
-    # Initialize OBS config on the first run.
+def prepare_obs():
+    """Seed first-run config BEFORE starting OBS (no forced terminate/restart)."""
+    base = Path.home() / ".config" / "obs-studio"
+    profile = base / "basic" / "profiles" / "Auto"
+    profile.mkdir(parents=True, exist_ok=True)
+    (base / "basic" / "scenes").mkdir(parents=True, exist_ok=True)
+    DIAG.mkdir(exist_ok=True)
     (Path.home() / "Videos").mkdir(exist_ok=True)
 
-    first = obs_proc()
-    time.sleep(8)
-    first.terminate()
-
-    try:
-        first.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        first.kill()
-        first.wait()
-
-    config = (
-        Path.home()
-        / ".config/obs-studio/plugin_config/obs-websocket/config.json"
+    (base / "user.ini").write_text(
+        "[General]\nFirstRun=false\nConfirmOnExit=false\n"
+        "[Basic]\nProfile=Auto\nProfileDir=Auto\n"
+        "SceneCollection=Untitled\nSceneCollectionFile=Untitled\n"
+        "[BasicWindow]\nWarnBeforeStoppingStream=false\n"
+        "WarnBeforeStoppingRecord=false\n",
+        encoding="utf-8",
     )
-    config.parent.mkdir(parents=True, exist_ok=True)
-
-    try:
-        data = json.loads(config.read_text(encoding="utf-8"))
-    except (FileNotFoundError, ValueError):
-        data = {}
-
+    (profile / "basic.ini").write_text(
+        "[General]\nName=Auto\n"
+        "[Video]\nBaseCX=1280\nBaseCY=720\nOutputCX=1280\nOutputCY=720\nFPSCommon=30\n"
+        "[Audio]\nSampleRate=48000\nChannelSetup=Stereo\n"
+        "[Output]\nMode=Simple\n"
+        "[SimpleOutput]\nVBitrate=2500\nABitrate=160\nStreamEncoder=x264\n"
+        f"FilePath={DIAG}\nRecFormat=mkv\nRecEncoder=x264\n",
+        encoding="utf-8",
+    )
     password = secrets.token_urlsafe(24)
-    data.update(
-        {
-            "server_enabled": True,
-            "server_port": 4455,
-            "auth_required": True,
-            "server_password": password,
-            "first_load": False,
-            "alerts_enabled": False,
-        }
-    )
+    websocket = base / "plugin_config" / "obs-websocket" / "config.json"
+    websocket.parent.mkdir(parents=True, exist_ok=True)
+    websocket.write_text(json.dumps({
+        "server_enabled": True,
+        "server_port": 4455,
+        "auth_required": True,
+        "server_password": password,
+        "first_load": False,
+        "alerts_enabled": False,
+    }), encoding="utf-8")
+    return password
 
-    config.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    process = obs_proc()
 
+def launch_obs():
+    password = prepare_obs()
+    args = ["obs", "--disable-missing-files-check", "--profile", "Auto",
+            "--websocket_port", "4455", "--websocket_password", password,
+            "--websocketipv4only"]
+    process = spawn(args, "obs.log")
     client = None
-    for _ in range(70):
+    failure = None
+    for attempt in range(45):
         if process.poll() is not None:
-            raise RuntimeError(
-                "OBS closed during startup; see diagnostics/obs.log"
-            )
-
-        try:
-            candidate = obs.ReqClient(
-                host="127.0.0.1",
-                port=4455,
-                password=password,
-                timeout=2,
-            )
-            candidate.get_version()
-            client = candidate
+            failure = f"OBS exited with code {process.returncode}"
             break
-        except Exception:
-            time.sleep(1)
-
+        try:
+            client = obs.ReqClient(host="127.0.0.1", port=4455,
+                                   password=password, timeout=2)
+            version = client.get_version()
+            log(f"OBS WebSocket is connected (OBS {getattr(version, 'obs_version', '?')})")
+            break
+        except Exception as exc:
+            failure = f"port 4455 not ready ({type(exc).__name__})"
+            if attempt in (5, 15, 30):
+                log(f"Waiting for OBS WebSocket... {attempt + 1}/45")
+            time.sleep(2)
     if client is None:
-        raise RuntimeError(
-            "OBS WebSocket did not start; see diagnostics/obs.log"
-        )
-
+        log(f"ERROR: {failure}")
+        show_log("obs.log", 100)
+        try:
+            latest = sorted((Path.home() / ".config" / "obs-studio" / "logs").glob("*.txt"))
+            if latest:
+                destination = DIAG / "obs-native.log"
+                shutil.copy2(latest[-1], destination)
+                show_log("obs-native.log", 60)
+        except Exception as exc:
+            log(f"Could not copy native OBS log: {exc}")
+        raise RuntimeError("OBS failed to start its WebSocket on port 4455. "
+                           "Check log lines above and uploaded diagnostics.")
     return process, client
 
 
-def configure_obs(client):
-    available = set(client.get_input_kind_list().input_kinds)
-    required = {"xshm_input", "pulse_output_capture"}
-
-    if not required.issubset(available):
-        raise RuntimeError(
-            f"OBS missing source kinds: {sorted(required - available)}"
-        )
-
-    try:
-        client.set_video_settings(
-            fps_numerator=30,
-            fps_denominator=1,
-            base_width=1280,
-            base_height=720,
-            output_width=1280,
-            output_height=720,
-        )
-    except Exception as exc:
-        print(
-            f"Warning: OBS video settings unchanged: {exc}",
-            flush=True,
-        )
-
-    scenes = {
-        x["sceneName"] for x in client.get_scene_list().scenes
-    }
-
+def obs_sources(client):
+    kinds = set(client.get_input_kind_list().input_kinds)
+    expected = {"xshm_input", "pulse_output_capture"}
+    if not expected.issubset(kinds):
+        raise RuntimeError(f"OBS lacks required Linux input sources: {expected - kinds}")
+    # Check the screen/audio sources before adding them. The existing scene may
+    # already exist because OBS creates default scenes for new profiles.
+    scenes = {scene["sceneName"] for scene in client.get_scene_list().scenes}
     if SCENE not in scenes:
         client.create_scene(SCENE)
-
     client.set_current_program_scene(SCENE)
-
-    existing = {
-        x["inputName"] for x in client.get_input_list().inputs
-    }
-
-    if SCREEN not in existing:
-        client.create_input(
-            SCENE,
-            SCREEN,
-            "xshm_input",
-            {"screen": 0},
-            True,
-        )
-
-    if AUDIO not in existing:
-        client.create_input(
-            SCENE,
-            AUDIO,
-            "pulse_output_capture",
-            {"device": "browser_audio.monitor"},
-            True,
-        )
-
-    print(
-        "OBS scene configured with display and audio sources",
-        flush=True,
-    )
+    inputs = {item["inputName"] for item in client.get_input_list().inputs}
+    if SCREEN not in inputs:
+        client.create_input(SCENE, SCREEN, "xshm_input", {"screen": 0}, True)
+    if AUDIO not in inputs:
+        client.create_input(SCENE, AUDIO, "pulse_output_capture",
+                            {"device": "browser_audio.monitor"}, True)
+    log("OBS video source=XSHM screen 0; audio=browser_audio.monitor")
 
 
-def launch_chrome(url):
+def start_chrome(url, warp):
+    cmd = ["google-chrome", "--no-first-run", "--no-default-browser-check",
+           "--disable-dev-shm-usage", "--password-store=basic",
+           "--autoplay-policy=no-user-gesture-required",
+           "--user-data-dir=/tmp/authorized-obs-chrome",
+           "--window-size=1280,720", "--kiosk"]
+    if warp == "on":
+        cmd += ["--proxy-server=socks5://127.0.0.1:40000", "--disable-quic"]
+    cmd.append(url)
     env = os.environ.copy()
     env["PULSE_SINK"] = "browser_audio"
-
-    browser = bg(
-        [
-            "google-chrome",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-dev-shm-usage",
-            "--password-store=basic",
-            "--user-data-dir=/tmp/obs-authorized-browser",
-            "--window-size=1280,720",
-            "--kiosk",
-            url,
-        ],
-        "chrome.log",
-        env=env,
-    )
-
-    time.sleep(12)
-
-    if browser.poll() is not None:
-        raise RuntimeError(
-            "Chrome exited unexpectedly; see diagnostics/chrome.log"
-        )
-
-    run(
-        [
-            "ffmpeg",
-            "-y",
-            "-loglevel",
-            "error",
-            "-f",
-            "x11grab",
-            "-video_size",
-            "1280x720",
-            "-framerate",
-            "1",
-            "-i",
-            f"{DISPLAY}.0",
-            "-frames:v",
-            "1",
-            str(DIAGNOSTICS / "browser.png"),
-        ]
-    )
-
-    print(
-        "Saved browser screenshot for checking playback",
-        flush=True,
-    )
-    return browser
+    chrome = spawn(cmd, "chrome.log", env=env)
+    time.sleep(15)
+    if chrome.poll() is not None:
+        show_log("chrome.log")
+        raise RuntimeError(f"Chrome exited early with code {chrome.returncode}")
+    result = execute(["ffmpeg", "-y", "-loglevel", "error", "-f", "x11grab",
+                      "-video_size", "1280x720", "-i", f"{DISPLAY}.0",
+                      "-frames:v", "1", str(DIAG / "browser.png")], check=False,
+                     capture_output=True, text=True)
+    if result.returncode != 0:
+        log("WARNING: browser screenshot failed: " + result.stderr[-400:])
+    else:
+        log("browser.png saved; inspect it for website playback errors")
+    return chrome
 
 
-def preview(client):
+def make_preview(client):
     try:
-        client.set_record_directory(str(DIAGNOSTICS))
-    except Exception:
-        pass
-
+        client.set_record_directory(str(DIAG))
+    except Exception as exc:
+        log(f"Record directory request unavailable: {type(exc).__name__}; using OBS profile output directory")
     client.start_record()
-    print("Recording a 20-second OBS preview", flush=True)
+    log("Recording 20-second OBS preview")
     time.sleep(20)
-
-    result = client.stop_record()
-    path = getattr(result, "output_path", "")
-
-    if not path or not Path(path).is_file():
-        raise RuntimeError("OBS recording output was not found")
-
-    source = Path(path)
-    dest = DIAGNOSTICS / source.name
-
-    if source.resolve() != dest.resolve():
-        shutil.copy2(source, dest)
-
-    if dest.stat().st_size < 100_000:
-        raise RuntimeError(
-            "OBS preview recording is unusually small; inspect diagnostics"
-        )
-
-    print(
-        f"Recorded: {dest.name}; inspect video AND audio",
-        flush=True,
-    )
+    output = getattr(client.stop_record(), "output_path", None)
+    if not output or not Path(output).is_file():
+        raise RuntimeError("OBS did not return a valid recording file")
+    file_path = Path(output)
+    if file_path.parent.resolve() != DIAG.resolve():
+        shutil.copy2(file_path, DIAG / file_path.name)
+    log(f"Preview recorded ({file_path.stat().st_size} bytes): {file_path.name}")
+    log("IMPORTANT: preview file must be checked for actual moving video/audio")
 
 
-def broadcast(client, slot, minutes, server, obs_process, browser_process):
-    # Only the selected key is provided to OBS as its RTMP credential.
-    # Do not print or log OKRU_KEYS values.
-    client.set_stream_service_settings(
-        "rtmp_custom",
-        {
-            "server": server,
-            "key": OKRU_KEYS[slot],
-        },
-    )
-
+def stream_okru(client, slot, server, seconds, obs_process, chrome_process):
+    client.set_stream_service_settings("rtmp_custom", {
+        "server": server, "key": OKRU_KEYS[slot]
+    })
     client.start_stream()
-
-    wait_for(
-        lambda: client.get_stream_status().output_active,
-        "OBS streaming",
-        40,
-    )
-
-    print(
-        f"OBS publishing to OK.ru slot {slot} for {minutes} minute(s)",
-        flush=True,
-    )
-
+    wait_until(lambda: client.get_stream_status().output_active,
+               "OBS RTMP publishing", timeout=40)
+    log(f"OBS streaming started to selected OK.ru slot {slot}")
+    log("OBS output_active does NOT prove audience-visible OK.ru playback")
+    started = time.monotonic()
     try:
-        for second in range(minutes * 60):
-            if (
-                obs_process.poll() is not None
-                or browser_process.poll() is not None
-            ):
-                raise RuntimeError("Chrome or OBS exited unexpectedly")
-
-            if second % 10 == 0:
-                status = client.get_stream_status()
-
-                if not status.output_active:
-                    raise RuntimeError(
-                        "OBS stream stopped or RTMP connection failed"
-                    )
-
-                print(
-                    f"OBS output active: {second}s",
-                    flush=True,
-                )
-
-            time.sleep(1)
-
+        while time.monotonic() - started < seconds:
+            if obs_process.poll() is not None or chrome_process.poll() is not None:
+                raise RuntimeError("OBS or Chrome exited while streaming")
+            status = client.get_stream_status()
+            if not status.output_active:
+                raise RuntimeError("OBS stream output became inactive")
+            elapsed = int(time.monotonic() - started)
+            log(f"OK.ru slot={slot}, encoder active, elapsed={elapsed}s/{seconds}s")
+            time.sleep(min(10, max(0, seconds - (time.monotonic() - started))))
     finally:
         try:
             if client.get_stream_status().output_active:
                 client.stop_stream()
-        except Exception:
-            pass
+        except Exception as exc:
+            log(f"Could not stop stream cleanly: {type(exc).__name__}")
 
 
 def main():
-    DIAGNOSTICS.mkdir(parents=True, exist_ok=True)
-
-    url, mode, slot, minutes, server = input_config()
-
-    start_display()
-    obs_process, client = start_obs()
-    configure_obs(client)
-    browser_process = launch_chrome(url)
-
-    if mode == "preview":
-        preview(client)
-    else:
-        broadcast(
-            client,
-            slot,
-            minutes,
-            server,
-            obs_process,
-            browser_process,
-        )
-
-    print(
-        "Finished. Check the diagnostics artifact and OK.ru broadcast dashboard.",
-        flush=True,
-    )
+    DIAG.mkdir(parents=True, exist_ok=True)
+    url, mode, slot, duration, warp, server = config()
+    linux_desktop()
+    obs_process, client = launch_obs()
+    try:
+        obs_sources(client)
+        chrome_process = start_chrome(url, warp)
+        if mode == "preview":
+            make_preview(client)
+        else:
+            stream_okru(client, slot, server, duration * 60, obs_process, chrome_process)
+        log("Capture workflow completed")
+    except Exception:
+        show_log("obs.log", 70)
+        show_log("chrome.log", 30)
+        raise
+    finally:
+        try:
+            client.disconnect()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
