@@ -123,7 +123,8 @@ jobs:
           VIDEO_SELECTOR: ${{ inputs.video_selector }}
           STREAM_MAX_MINUTES: '345'
           STREAM_INGEST_URL: ${{ secrets.OKRU_INGEST_URL }}
-          STREAM_KEY: ${{ secrets[steps.channel.outputs.secret_name] }}
+          # STREAM_KEY: ${{ secrets[steps.channel.outputs.secret_name] }}
+          STREAM_KEY: ${{ fromJSON(secrets.OKRU_STREAM_KEYS || '{}')[steps.channel.outputs.id] || secrets[steps.channel.outputs.secret_name] }}
         run: |
           set -euo pipefail
 
