@@ -1,28 +1,26 @@
 
-name: Browser Webpage to OK.ru (OBS)
+name: Webpage to OBS to OK.ru
 
 on:
   workflow_dispatch:
     inputs:
       page_url:
-        description: 'Official authorized webpage URL (not m3u8)'
+        description: 'Original authorized webpage URL (not an m3u8)'
+        required: true
         type: string
-        required: true
         default: 'https://example.com'
-
       mode:
-        description: 'Preview a 20-second OBS recording or stream to OK.ru'
-        type: choice
+        description: 'preview = 20 sec recording; stream = publish to OK.ru'
         required: true
+        type: choice
         default: preview
         options:
           - preview
           - stream
-
       ok_stream:
-        description: 'Select ONE OK.ru publishing key hardcoded in capture.py'
-        type: choice
+        description: 'OK.ru stream destination'
         required: true
+        type: choice
         default: s2.1
         options:
           - s2.1
@@ -35,18 +33,29 @@ on:
           - s2.8
           - s2.9
           - s2.10
-
-      ok_server_url:
-        description: 'OK.ru RTMP server URL; confirm this in your OK.ru broadcast settings'
-        type: string
+      hours:
+        description: 'Number of hours to stream (0-5)'
         required: true
-        default: 'rtmp://vsu.mycdn.me/input'
-
-      minutes:
-        description: 'Stream duration in minutes (1-300; ignored for preview)'
         type: number
+        default: 1
+      minutes:
+        description: 'Additional minutes (0-59); 1 hour + 20 minutes = 80 min'
         required: true
-        default: 15
+        type: number
+        default: 20
+      cloudflare_warp:
+        description: 'Cloudflare WARP local proxy for Chrome only (on/off)'
+        required: true
+        type: choice
+        default: 'off'
+        options:
+          - 'off'
+          - 'on'
+      ok_server_url:
+        description: 'Your OK.ru RTMP(S) server, from your OK.ru broadcast settings'
+        required: true
+        type: string
+        default: 'rtmp://vsu.mycdn.me/input'
 
 permissions:
   contents: read
@@ -54,40 +63,78 @@ permissions:
 jobs:
   capture:
     runs-on: ubuntu-24.04
-    timeout-minutes: 330
-
+    timeout-minutes: 340
     env:
       DISPLAY: ':99'
       PAGE_URL: ${{ inputs.page_url }}
       CAPTURE_MODE: ${{ inputs.mode }}
       OK_STREAM_SLOT: ${{ inputs.ok_stream }}
       OK_RTMP_SERVER: ${{ inputs.ok_server_url }}
-      CAPTURE_MINUTES: ${{ inputs.minutes }}
+      CAPTURE_HOURS: ${{ inputs.hours }}
+      CAPTURE_EXTRA_MINUTES: ${{ inputs.minutes }}
+      CLOUDFLARE_WARP: ${{ inputs.cloudflare_warp }}
+      QT_QPA_PLATFORM: xcb
+      LIBGL_ALWAYS_SOFTWARE: '1'
+      QT_X11_NO_MITSHM: '1'
 
     steps:
-      - name: Checkout project
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Install Linux desktop and OBS dependencies
+      - name: Install OBS, desktop, and capture dependencies
+        shell: bash
         run: |
+          set -euo pipefail
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             obs-studio xvfb x11-utils openbox pulseaudio pulseaudio-utils \
-            dbus-x11 ffmpeg
+            ffmpeg mesa-utils libgl1-mesa-dri libglx-mesa0 libegl1 \
+            dbus-x11 libxcb-cursor0 curl ca-certificates gnupg
           python -m pip install -r requirements.txt
+          command -v obs
           command -v google-chrome
           obs --version
           google-chrome --version
 
-      - name: Run Chrome capture and selected OK.ru output
-        run: python scripts/capture.py
+      - name: Enable Cloudflare WARP local proxy for Chrome
+        if: ${{ inputs.cloudflare_warp == 'on' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | \
+            sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${CODENAME} main" | \
+            sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y cloudflare-warp
+          sudo systemctl start warp-svc
+          sudo warp-cli --accept-tos registration new
+          sudo warp-cli --accept-tos mode proxy
+          sudo warp-cli --accept-tos proxy port 40000
+          sudo warp-cli --accept-tos connect
+          for attempt in $(seq 1 25); do
+            if curl -fsS --max-time 12 --socks5-hostname 127.0.0.1:40000 \
+              https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -qx 'warp=on'; then
+              echo 'WARP proxy verified for Chrome (127.0.0.1:40000).'
+              exit 0
+            fi
+            sleep 2
+          done
+          sudo warp-cli --accept-tos status || true
+          echo 'WARP was requested but local proxy could not be verified. Aborting.' >&2
+          exit 1
 
-      - name: Upload browser preview and diagnostic logs
+      - name: Capture original webpage and optionally broadcast
+        shell: bash
+        run: python -u scripts/capture.py
+
+      - name: Upload diagnostic logs and preview
         if: always()
         uses: actions/upload-artifact@v4
         with:
