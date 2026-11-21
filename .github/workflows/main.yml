@@ -1,0 +1,93 @@
+
+name: 24/7 Pro Stream Bot (OBS Test) - Single Chrome
+run-name: "Single Chrome -> OK.ru channel ${{ inputs.okru_stream_channel }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: 'ONE normal webpage URL (not a direct .m3u8)'
+        required: true
+        type: string
+      okru_stream_channel:
+        description: 'Selected OK.ru channel label (e.g. 1, 1.1, s2.1)'
+        required: true
+        type: string
+        default: '1'
+      server_selection:
+        description: 'Optional exact server button label, or None'
+        required: true
+        type: string
+        default: 'None'
+      stream_quality:
+        description: 'OBS output quality (not source DRM/quality override)'
+        required: true
+        type: choice
+        options:
+          - 'Original (1080p Max)'
+          - '1080p'
+          - '720p'
+          - '480p'
+          - '360p'
+        default: '720p'
+      custom_duration:
+        description: 'Example: 1h 20m, 45m, 5h, None (up to 5h 45m)'
+        required: true
+        type: string
+        default: '1h'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: single-stream-${{ inputs.okru_stream_channel }}
+  cancel-in-progress: false
+
+jobs:
+  stream:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install OBS, virtual screen and audio
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            obs-studio xvfb pulseaudio pulseaudio-utils dbus-x11 curl ca-certificates
+
+      - name: Install Google Chrome Stable
+        run: |
+          curl -fsSLo /tmp/google-chrome.deb \
+            https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y /tmp/google-chrome.deb
+          google-chrome-stable --version
+
+      - name: Install Node dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Validate JavaScript
+        run: node --check stream.js
+
+      - name: Stream one authorized URL in one Chrome
+        env:
+          TARGET_URL: ${{ inputs.target_url }}
+          OKRU_STREAM_ID: ${{ inputs.okru_stream_channel }}
+          SERVER_SELECTION: ${{ inputs.server_selection }}
+          STREAM_QUALITY: ${{ inputs.stream_quality }}
+          CUSTOM_DURATION: ${{ inputs.custom_duration }}
+          OKRU_STREAM_KEYS_JSON: ${{ secrets.OKRU_STREAM_KEYS_JSON }}
+          CHROME_PATH: /usr/bin/google-chrome-stable
+        run: |
+          pulseaudio --start --exit-idle-time=-1
+          pactl load-module module-null-sink sink_name=stream_sink \
+            sink_properties=device.description=StreamSink
+          pactl set-default-sink stream_sink
+          pactl set-default-source stream_sink.monitor
+          xvfb-run -a -s "-screen 0 1920x1080x24 -ac" node stream.js
