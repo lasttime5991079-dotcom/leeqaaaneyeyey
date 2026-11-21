@@ -1,0 +1,15 @@
+
+{
+  "name": "single-chrome-obs-stream-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "One browser, one URL, verified video, OBS RTMP broadcasting",
+  "main": "stream.js",
+  "scripts": {
+    "check": "node --check stream.js"
+  },
+  "dependencies": {
+    "obs-websocket-js": "^5.0.0",
+    "puppeteer-core": "^24.0.0"
+  }
+}
