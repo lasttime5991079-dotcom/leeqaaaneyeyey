@@ -1,0 +1,71 @@
+
+name: Authorized Webpage Capture (Chrome + OBS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      page_url:
+        description: 'Full authorized page URL (https://...), not an m3u8'
+        type: string
+        required: true
+        default: 'https://example.com'
+      mode:
+        description: 'Preview records 20 seconds; Stream publishes to configured RTMP'
+        type: choice
+        required: true
+        default: preview
+        options:
+          - preview
+          - stream
+      minutes:
+        description: 'Streaming duration (1-300 minutes; ignored for preview)'
+        type: number
+        required: true
+        default: 15
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    env:
+      PAGE_URL: ${{ inputs.page_url }}
+      CAPTURE_MODE: ${{ inputs.mode }}
+      CAPTURE_MINUTES: ${{ inputs.minutes }}
+      RTMP_SERVER: ${{ secrets.RTMP_SERVER }}
+      RTMP_KEY: ${{ secrets.RTMP_KEY }}
+      DISPLAY: ':99'
+
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install OBS and Linux display/audio dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            obs-studio xvfb x11-utils openbox pulseaudio pulseaudio-utils \
+            dbus-x11 ffmpeg
+          python -m pip install -r requirements.txt
+          command -v google-chrome
+          obs --version
+          google-chrome --version
+
+      - name: Capture the browser using OBS
+        run: python scripts/capture.py
+
+      - name: Upload diagnostic screenshot and preview recording
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-capture-diagnostics
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 1
