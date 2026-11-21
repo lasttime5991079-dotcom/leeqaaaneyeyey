@@ -1,24 +1,49 @@
 
-name: Authorized Webpage Capture (Chrome + OBS)
+name: Browser Webpage to OK.ru (OBS)
 
 on:
   workflow_dispatch:
     inputs:
       page_url:
-        description: 'Full authorized page URL (https://...), not an m3u8'
+        description: 'Official authorized webpage URL (not m3u8)'
         type: string
         required: true
         default: 'https://example.com'
+
       mode:
-        description: 'Preview records 20 seconds; Stream publishes to configured RTMP'
+        description: 'Preview a 20-second OBS recording or stream to OK.ru'
         type: choice
         required: true
         default: preview
         options:
           - preview
           - stream
+
+      ok_stream:
+        description: 'Select ONE OK.ru publishing key hardcoded in capture.py'
+        type: choice
+        required: true
+        default: s2.1
+        options:
+          - s2.1
+          - s2.2
+          - s2.3
+          - s2.4
+          - s2.5
+          - s2.6
+          - s2.7
+          - s2.8
+          - s2.9
+          - s2.10
+
+      ok_server_url:
+        description: 'OK.ru RTMP server URL; confirm this in your OK.ru broadcast settings'
+        type: string
+        required: true
+        default: 'rtmp://vsu.mycdn.me/input'
+
       minutes:
-        description: 'Streaming duration (1-300 minutes; ignored for preview)'
+        description: 'Stream duration in minutes (1-300; ignored for preview)'
         type: number
         required: true
         default: 15
@@ -30,24 +55,25 @@ jobs:
   capture:
     runs-on: ubuntu-24.04
     timeout-minutes: 330
+
     env:
+      DISPLAY: ':99'
       PAGE_URL: ${{ inputs.page_url }}
       CAPTURE_MODE: ${{ inputs.mode }}
+      OK_STREAM_SLOT: ${{ inputs.ok_stream }}
+      OK_RTMP_SERVER: ${{ inputs.ok_server_url }}
       CAPTURE_MINUTES: ${{ inputs.minutes }}
-      RTMP_SERVER: ${{ secrets.RTMP_SERVER }}
-      RTMP_KEY: ${{ secrets.RTMP_KEY }}
-      DISPLAY: ':99'
 
     steps:
-      - name: Check out this repository
+      - name: Checkout project
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Install Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Install OBS and Linux display/audio dependencies
+      - name: Install Linux desktop and OBS dependencies
         run: |
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
@@ -58,10 +84,10 @@ jobs:
           obs --version
           google-chrome --version
 
-      - name: Capture the browser using OBS
+      - name: Run Chrome capture and selected OK.ru output
         run: python scripts/capture.py
 
-      - name: Upload diagnostic screenshot and preview recording
+      - name: Upload browser preview and diagnostic logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
