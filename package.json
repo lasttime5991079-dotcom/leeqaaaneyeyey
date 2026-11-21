@@ -1,15 +1,15 @@
-
 {
-  "name": "single-chrome-obs-stream-bot",
+  "name": "sequential-obs-stream",
   "version": "1.0.0",
   "private": true,
-  "description": "One browser, one URL, verified video, OBS RTMP broadcasting",
-  "main": "stream.js",
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
-    "check": "node --check stream.js"
+    "start": "node stream.js"
   },
   "dependencies": {
-    "obs-websocket-js": "^5.0.0",
-    "puppeteer-core": "^24.0.0"
+    "obs-websocket-js": "5.0.8",
+    "puppeteer-core": "25.18.1"
   }
 }
