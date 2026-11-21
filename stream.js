@@ -1,476 +1,746 @@
-
 'use strict';
 
-/**
- * Single-Chrome, single-URL OBS broadcaster.
- * Use only with content you are authorized to view and rebroadcast.
- * No DRM bypass, stealth plugin, browser security overrides, or proxy bypass.
- */
-const fs = require('node:fs');
-const os = require('node:os');
-const path = require('node:path');
-const crypto = require('node:crypto');
-const { spawn } = require('node:child_process');
+const { performance } = require('node:perf_hooks');
+const { setTimeout: delay } = require('node:timers/promises');
 const puppeteer = require('puppeteer-core');
-const { OBSWebSocket } = require('obs-websocket-js');
+const { spawn } = require('node:child_process');
+const { randomBytes } = require('node:crypto');
+const { mkdir, mkdtemp, rm, writeFile } = require('node:fs/promises');
+const { createServer } = require('node:net');
+const { tmpdir } = require('node:os');
+const { join } = require('node:path');
+const { OBSWebSocket } = require('obs-websocket-js/json');
 
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-const log = (...args) => console.log(new Date().toISOString(), ...args);
-const QUALITY = {
+const qualities = {
   'Original (1080p Max)': [1920, 1080, 6000],
   '1080p': [1920, 1080, 4500],
   '720p': [1280, 720, 3000],
   '480p': [854, 480, 1500],
-  '360p': [640, 360, 800]
+  '360p': [640, 360, 800],
 };
-const [width, height, bitrate] = QUALITY[process.env.STREAM_QUALITY] || QUALITY['720p'];
-const CAPTURE_WIDTH = 1920;
-const CAPTURE_HEIGHT = 1080;
-const OBS_PASSWORD = crypto.randomBytes(24).toString('hex');
-const MAX_DURATION_MS = 345 * 60 * 1000; // Leave time for cleanup before GitHub's six-hour limit.
-const POLL_MS = 2000;
-const FREEZE_MS = 14000;
-const READY_TIMEOUT_MS = 75000;
-const MAX_RECOVERIES = 4;
-const OBS_SERVER = 'rtmp://vsu.okcdn.ru/input/';
+const timing = { navigation: 20_000, startup: 35_000, poll: 1_000, cooldown: 15_000 };
+const CHANNEL_VARIANTS = { 1: 11, 2: 2, 3: 6, 4: 5, 5: 7, s1: 10, s2: 10 };
+const STREAM_KEYS = Object.fromEntries([
+  ...Array.from({ length: 8 }, (_, index) => String(index + 1)),
+  ...Object.entries(CHANNEL_VARIANTS).flatMap(([id, count]) =>
+    Array.from({ length: count }, (_, index) => `${id}.${index + 1}`)),
+].map((id) => [id, '']));
+const ORIGINAL_INGEST = 'rtmp://vsu.okcdn.ru/input/';
+const PLAY_BUTTON = '.jw-icon-display[aria-label="Play"], button[data-plyr="play"], .vjs-big-play-button, .fp-play';
+const mediaErrors = {
+  2: 'video network error',
+  3: 'video decode error',
+  4: 'unsupported video source or codec',
+};
 
-let browser = null;
-let page = null;
-let obsProcess = null;
-let obsConnected = false;
-let streaming = false;
-let shuttingDown = false;
-const obs = new OBSWebSocket();
+class BotError extends Error {}
 
-function readConfig() {
-  const raw = (process.env.TARGET_URL || '').trim();
-  if (!raw) throw new Error('TARGET_URL is required (one ordinary webpage URL).');
-  const parsed = new URL(raw);
-  if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Only http/https URLs are supported.');
-  if (/\.m3u8(?:$|\?)/i.test(raw)) throw new Error('Enter a webpage URL, not a direct M3U8 playlist.');
-  if ((raw.match(/https?:\/\//gi) || []).length !== 1) throw new Error('Enter exactly one URL.');
-
-  const channel = (process.env.OKRU_STREAM_ID || '').trim();
-  if (!channel) throw new Error('OKRU_STREAM_ID is required.');
-  let keys;
-  try { keys = JSON.parse(process.env.OKRU_STREAM_KEYS_JSON || '{}'); }
-  catch { throw new Error('OKRU_STREAM_KEYS_JSON must be valid JSON in a GitHub Actions secret.'); }
-  if (!keys || typeof keys !== 'object' || Array.isArray(keys)) {
-    throw new Error('OKRU_STREAM_KEYS_JSON must be a JSON object of channel -> stream key.');
+function readSettings(env) {
+  const targets = new Map();
+  for (const entry of (env.TARGET_URLS ?? '').split(',')) {
+    const item = entry.trim();
+    if (!item) continue;
+    const extended = item.startsWith('!');
+    const address = extended ? item.slice(1).trim() : item;
+    const number = targets.size + 1;
+    let url;
+    try {
+      const explicitScheme = /^[a-z][a-z\d+.-]*:/i.test(address) && !/^[^/:]+:\d+(?:[/?#]|$)/.test(address);
+      url = new URL(explicitScheme ? address : `https://${address}`);
+      if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new Error();
+    } catch {
+      throw new BotError(`Source ${number} requires a valid HTTP(S) URL without embedded credentials.`);
+    }
+    if (!targets.has(url.href)) {
+      targets.set(url.href, { number, url: url.href, stallMs: extended ? 20_000 : 8_000 });
+    }
   }
-  const key = keys[channel];
-  if (typeof key !== 'string' || !key.trim()) {
-    throw new Error(`No stream key found for channel '${channel}'. Check OKRU_STREAM_KEYS_JSON.`);
+  if (!targets.size) throw new BotError('Provide at least one source URL in TARGET_URLS.');
+
+  const duration = (env.CUSTOM_DURATION || 'None').trim();
+  const parts = /^(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?$/i.exec(duration);
+  const maxMinutes = Number(env.STREAM_MAX_MINUTES || 345);
+  const minutes = /^none$/i.test(duration) ? maxMinutes : parts && Number(parts[1] ?? 0) * 60 + Number(parts[2] ?? 0);
+  if (!Number.isInteger(maxMinutes) || maxMinutes < 1 || maxMinutes > 345 ||
+      !Number.isInteger(minutes) || minutes < 1 || minutes > maxMinutes) {
+    throw new BotError('Choose a duration up to 5h 45m, such as 4h 30m, or use None.');
+  }
+
+  const quality = env.STREAM_QUALITY || 'Original (1080p Max)';
+  if (!Object.hasOwn(qualities, quality)) throw new BotError('Select a supported STREAM_QUALITY.');
+  const [width, height, bitrate] = qualities[quality];
+  const serverSelection = (env.SERVER_SELECTION || 'None').trim();
+  const channel = (env.OKRU_STREAM_ID || '1').trim().toLowerCase();
+  if (!Object.hasOwn(STREAM_KEYS, channel)) throw new BotError('Unknown OK.ru channel ID.');
+  const ingestUrl = env.STREAM_INGEST_URL?.trim() || ORIGINAL_INGEST;
+  const streamKey = env.STREAM_KEY?.trim() || STREAM_KEYS[channel];
+  if (!/^rtmps?:\/\/[^\s]+$/i.test(ingestUrl) || !streamKey) {
+    throw new BotError(`Configure OKRU_STREAM_KEY_${channel.toUpperCase().replaceAll('.', '_')} and verify the RTMP server address.`);
+  }
+  if (env.PROXY_ENGINE && env.PROXY_ENGINE !== 'None (Direct GitHub IP)') {
+    throw new BotError('This workflow is configured for direct runner networking.');
   }
   return {
-    targetUrl: parsed.href,
-    safeHost: parsed.host,
-    channel,
-    key: key.trim(),
-    serverSelection: (process.env.SERVER_SELECTION || 'None').trim(),
-    durationMs: parseDuration(process.env.CUSTOM_DURATION || 'None')
+    sources: [...targets.values()], width, height, bitrate, ingestUrl, streamKey,
+    durationMs: minutes * 60_000,
+    videoSelector: (env.VIDEO_SELECTOR || '').trim() || 'video',
+    serverSelection: /^none$/i.test(serverSelection) ? '' : serverSelection,
   };
 }
 
-function parseDuration(raw) {
-  if (/^none$/i.test(raw.trim())) return MAX_DURATION_MS;
-  const match = raw.trim().match(/^(?:(\d+)\s*h(?:ours?)?\s*)?(?:(\d+)\s*m(?:in(?:utes?)?)?\s*)?$/i);
-  if (!match || (!match[1] && !match[2])) throw new Error('CUSTOM_DURATION examples: 1h, 1h 20m, 45m, None.');
-  const ms = ((Number(match[1] || 0) * 60) + Number(match[2] || 0)) * 60 * 1000;
-  if (!Number.isSafeInteger(ms) || ms <= 0 || ms > MAX_DURATION_MS) {
-    throw new Error('Duration must be between 1 minute and 5h 45m on GitHub-hosted runners.');
-  }
-  return ms;
-}
-
-function prepareObsConfig() {
-  const root = path.join(os.homedir(), '.config', 'obs-studio');
-  const profile = path.join(root, 'basic', 'profiles', 'StreamBot');
-  const wsDir = path.join(root, 'plugin_config', 'obs-websocket');
-  fs.mkdirSync(profile, { recursive: true });
-  fs.mkdirSync(wsDir, { recursive: true });
-  fs.writeFileSync(path.join(root, 'global.ini'),
-    '[General]\nLicenseAccepted=true\n[BasicWindow]\nShowAutoConfig=false\nWarned=true\n');
-  fs.writeFileSync(path.join(profile, 'basic.ini'), [
-    '[General]', 'Name=StreamBot', '[Video]',
-    `BaseCX=${CAPTURE_WIDTH}`, `BaseCY=${CAPTURE_HEIGHT}`, `OutputCX=${width}`, `OutputCY=${height}`,
-    'FPSCommon=30', '[Audio]', 'SampleRate=48000', 'ChannelSetup=Stereo',
-    '[Output]', 'Mode=Simple', '[SimpleOutput]',
-    `VBitrate=${bitrate}`, 'ABitrate=160', 'StreamEncoder=x264',
-    'UseAdvanced=true', 'Preset=ultrafast', 'x264Settings=keyint=60 tune=zerolatency', ''
-  ].join('\n'));
-  fs.writeFileSync(path.join(wsDir, 'config.json'), JSON.stringify({
-    first_load: false,
-    server_enabled: true,
-    server_port: 4455,
-    alerts_enabled: false,
-    auth_required: true,
-    server_password: OBS_PASSWORD
-  }, null, 2), { mode: 0o600 });
-}
-
-async function launchObs() {
-  prepareObsConfig();
-  obsProcess = spawn('obs', ['--profile', 'StreamBot', '--disable-shutdown-check', '--websocket_ipv4_only'], {
-    stdio: ['ignore', 'pipe', 'pipe']
-  });
-  obsProcess.on('error', err => log('[OBS] Failed to launch:', err.message));
-  obsProcess.on('exit', (code, signal) => log(`[OBS] Process exited: ${code ?? signal}`));
-  for (const pipe of [obsProcess.stdout, obsProcess.stderr]) {
-    let carried = '';
-    pipe.on('data', chunk => {
-      carried += chunk.toString();
-      const lines = carried.split(/\r?\n/);
-      carried = lines.pop();
-      for (const line of lines) {
-        if (/\b(error|failed|warning)\b/i.test(line)) log('[OBS]', line.slice(0, 280));
-      }
-    });
-  }
-  for (let attempt = 0; attempt < 30; attempt++) {
-    if (obsProcess.exitCode !== null) break;
-    try {
-      await obs.connect('ws://127.0.0.1:4455', OBS_PASSWORD, { rpcVersion: 1 });
-      obsConnected = true;
-      log('[OBS] Authenticated WebSocket connection established.');
-      return;
-    } catch { await sleep(1000); }
-  }
-  throw new Error('OBS WebSocket did not start. Check OBS logs and installed OBS version (28+).');
-}
-
-async function configureObs(key) {
-  const sceneName = 'SingleChromeCapture';
-  const scenes = await obs.call('GetSceneList');
-  if (!scenes.scenes.some(s => s.sceneName === sceneName)) {
-    await obs.call('CreateScene', { sceneName });
-  }
-  const currentInputs = await obs.call('GetInputList');
-  if (!currentInputs.inputs.some(s => s.inputName === 'DesktopVideo')) {
-    await obs.call('CreateInput', {
-      sceneName,
-      inputName: 'DesktopVideo',
-      inputKind: 'xshm_input',
-      inputSettings: { show_cursor: false },
-      sceneItemEnabled: true
-    });
-  }
-  if (!currentInputs.inputs.some(s => s.inputName === 'DesktopAudio')) {
-    await obs.call('CreateInput', {
-      sceneName,
-      inputName: 'DesktopAudio',
-      inputKind: 'pulse_output_capture',
-      inputSettings: { device_id: 'default' },
-      sceneItemEnabled: true
-    });
-  }
-  await obs.call('SetCurrentProgramScene', { sceneName });
-  await obs.call('SetStreamServiceSettings', {
-    streamServiceType: 'rtmp_custom',
-    streamServiceSettings: { server: OBS_SERVER, key }
-  });
-  log('[OBS] Scene and selected channel configured; no stream has started yet.');
-}
-
-async function startBroadcast() {
-  if (streaming) return;
-  const status = await obs.call('GetStreamStatus');
-  if (!status.outputActive) await obs.call('StartStream');
-  let active = false;
-  for (let i = 0; i < 20; i++) {
-    const verify = await obs.call('GetStreamStatus');
-    if (verify.outputActive) { active = true; break; }
-    await sleep(1000);
-  }
-  if (!active) throw new Error('OBS did not confirm an active broadcast within 20 seconds.');
-  streaming = true;
-  log('[OBS] Broadcasting verified playback.');
-}
-
-async function stopBroadcast() {
-  if (!obsConnected) return;
-  try {
-    const status = await obs.call('GetStreamStatus');
-    if (status.outputActive) await obs.call('StopStream');
-  } catch (err) { log('[OBS] Stream stop warning:', err.message); }
-  streaming = false;
-}
-
-async function launchSingleChrome() {
-  const chrome = process.env.CHROME_PATH || '/usr/bin/google-chrome-stable';
-  if (!fs.existsSync(chrome)) throw new Error(`Google Chrome executable not found: ${chrome}`);
-  browser = await puppeteer.launch({
-    executablePath: chrome,
-    headless: false,
-    defaultViewport: null,
-    args: [
-      '--no-sandbox', // Required only in the isolated GitHub-hosted runner.
-      '--disable-dev-shm-usage',
-      `--window-size=${CAPTURE_WIDTH},${CAPTURE_HEIGHT}`,
-      '--window-position=0,0',
-      '--kiosk',
-      '--no-first-run',
-      '--no-default-browser-check'
-    ]
-  });
-  const pages = await browser.pages();
-  page = pages[0] || await browser.newPage();
-  for (const extra of pages.slice(1)) await extra.close().catch(() => {});
-  browser.on('targetcreated', async target => {
-    // No ad-popup window or backup page. Remain inside one browser + one intended tab.
-    if (target.type() === 'page') {
-      try { const p = await target.page(); if (p && p !== page) await p.close(); } catch {}
-    }
-  });
-  page.setDefaultNavigationTimeout(45000);
-  page.on('pageerror', err => log('[PAGE] JavaScript error:', err.message.slice(0, 220)));
-  page.on('requestfailed', req => {
-    if (req.isNavigationRequest()) log('[NETWORK] Navigation failed:', req.failure()?.errorText || 'Unknown error');
-  });
-  await page.evaluateOnNewDocument(() => {
-    window.__streamBotEvents = { encrypted: false, waitingForKey: false };
-    document.addEventListener('encrypted', () => { window.__streamBotEvents.encrypted = true; }, true);
-    document.addEventListener('waitingforkey', () => { window.__streamBotEvents.waitingForKey = true; }, true);
-  });
-  log('[CHROME] Launched one Chrome with one monitored tab.');
-}
-
-async function tryPlayFromPage() {
-  if (!page || page.isClosed()) return;
-  const selectors = [
-    'button[aria-label="Play"]', '.jw-icon-display', '.vjs-big-play-button',
-    '[data-plyr="play"]', '.plyr__control--overlaid'
-  ];
-  for (const frame of page.frames()) {
-    try {
-      const alreadyPlaying = await frame.evaluate(() =>
-        [...document.querySelectorAll('video')].some(v =>
-          v.clientWidth >= 100 && v.clientHeight >= 80 && !v.paused && !v.ended));
-      if (alreadyPlaying) continue; // Never toggle a live player's Play button.
-      for (const selector of selectors) {
-        const button = await frame.$(selector);
-        if (button) {
-          const visible = await button.isVisible().catch(() => false);
-          if (visible) { await button.click({ delay: 50 }).catch(() => {}); break; }
-        }
-      }
-      await frame.evaluate(() => {
-        for (const video of document.querySelectorAll('video')) {
-          if (video.clientWidth >= 100 && video.clientHeight >= 80 && video.paused) {
-            video.muted = false;
-            video.volume = 1.0;
-            video.play().catch(() => {}); // Normal browser policy applies.
-          }
-        }
-      });
-    } catch {}
-  }
-}
-
-async function clickServerIfRequested(serverName) {
-  if (!serverName || /^none$/i.test(serverName)) return;
-  for (let attempt = 0; attempt < 8; attempt++) {
+async function selectServer(page, label, signal, timings) {
+  const deadline = performance.now() + Math.min(8_000, timings.startup / 2);
+  while (performance.now() < deadline) {
     for (const frame of page.frames()) {
-      try {
-        const clicked = await frame.evaluate(name => {
-          const needle = name.trim().toLowerCase();
-          const elements = document.querySelectorAll('button, [role="button"], a');
-          for (const element of elements) {
-            if (element.getBoundingClientRect().width === 0) continue;
-            if ((element.textContent || '').trim().toLowerCase() === needle) {
-              element.click();
-              return true;
-            }
-          }
-          return false;
-        }, serverName);
-        if (clicked) { log('[PLAYER] Selected server:', serverName); await sleep(3000); return; }
-      } catch {}
+      signal.throwIfAborted();
+      const clicked = await frame.evaluate((name) => {
+        const buttons = [...document.querySelectorAll('button, [role="button"]')]
+          .filter((button) => button.getClientRects().length && !button.matches(':disabled, [aria-disabled="true"]'));
+        const text = (button) => (button.innerText ?? button.textContent ?? '').trim();
+        const control = buttons.find((button) => text(button) === name) ||
+          buttons.find((button) => text(button).includes(name));
+        control?.click();
+        return Boolean(control);
+      }, label).catch(() => false);
+      if (clicked) return;
     }
-    await sleep(1200);
+    await delay(timings.poll, undefined, { signal });
   }
-  log('[PLAYER] Requested server button not found:', serverName);
+  console.warn('Requested server button was unavailable. Checking the page’s default player.');
 }
 
-async function samplePlayback() {
-  if (!browser?.isConnected() || !page || page.isClosed()) return { type: 'BROWSER_CLOSED' };
-  let best = null;
-  let encrypted = false;
+async function installPlaybackDiagnostics(page) {
+  await page.evaluateOnNewDocument(() => {
+    const events = new WeakMap();
+    window.streamMediaEvents = events;
+    for (const type of ['encrypted', 'waitingforkey', 'playing', 'emptied']) {
+      document.addEventListener(type, ({ target }) => {
+        if (!(target instanceof HTMLVideoElement)) return;
+        const state = events.get(target) || {};
+        if (type === 'encrypted') state.encrypted = true;
+        if (type === 'waitingforkey') state.waitingForKey = true;
+        if (type === 'playing') state.waitingForKey = false;
+        if (type === 'emptied') events.delete(target);
+        else events.set(target, state);
+      }, true);
+    }
+  });
+  let fault;
+  const relevantRequest = (request) => ['document', 'media'].includes(request.resourceType()) ||
+    /\.(?:m3u8|mpd|m4s|ts)(?:[?#]|$)/i.test(request.url());
+  page.on('requestfailed', (request) => {
+    const reason = request.failure()?.errorText;
+    if (relevantRequest(request) && /^net::ERR_[A-Z0-9_]+$/.test(reason || '') && reason !== 'net::ERR_ABORTED') {
+      fault = reason;
+    }
+  });
+  page.on('response', (response) => {
+    if (response.status() >= 400 && relevantRequest(response.request())) fault = `HTTP ${response.status()}`;
+  });
+  return { lastFault: () => fault, reset: () => { fault = undefined; } };
+}
+
+async function inspectPlayer(page, selector) {
+  const snapshots = await Promise.all(page.frames().map(async (frame) => {
+    const observation = await frame.evaluate((css) => {
+      const monitor = globalThis.streamVideoMonitor ??= { ids: new WeakMap(), play: new WeakMap(), nextId: 0 };
+      const candidates = [...document.querySelectorAll(css)].filter((el) => el instanceof HTMLVideoElement);
+      let player;
+      for (const video of candidates) {
+        const rect = video.getBoundingClientRect();
+        const style = getComputedStyle(video);
+        if (style.visibility !== 'visible' || Number(style.opacity) === 0 ||
+            rect.bottom <= 0 || rect.right <= 0 || rect.top >= innerHeight || rect.left >= innerWidth) continue;
+        const area = rect.width * rect.height;
+        if (!area || area <= (player?.area ?? 0)) continue;
+        if (!monitor.ids.has(video)) monitor.ids.set(video, ++monitor.nextId);
+        const quality = video.getVideoPlaybackQuality?.();
+        const frames = quality ? quality.totalVideoFrames - quality.droppedVideoFrames : video.webkitDecodedFrameCount;
+        const media = window.streamMediaEvents?.get(video);
+        player = {
+          id: `${performance.timeOrigin}:${monitor.ids.get(video)}`,
+          area,
+          time: video.currentTime,
+          frames: Number.isFinite(frames) ? frames : null,
+          paused: video.paused,
+          ended: video.ended,
+          advancing: Boolean(video.videoWidth) && !video.paused && !video.ended && !video.seeking && video.readyState >= 2,
+          ready: video.readyState >= 1,
+          error: video.error?.code ?? 0,
+          playError: monitor.play.get(video)?.error,
+          encrypted: Boolean(media?.encrypted || video.mediaKeys),
+          waitingForKey: Boolean(media?.waitingForKey),
+        };
+      }
+      const alerts = [...document.querySelectorAll('.jw-error-msg, [role="alert"]')]
+        .filter((el) => el.getClientRects().length && getComputedStyle(el).visibility === 'visible');
+      const playerText = alerts.map((el) => el.innerText).join(' ');
+      const text = (playerText || document.body?.innerText || '').replace(/\s+/g, ' ');
+      const code = text.match(/\berror\s+code\s*:?\s*(\d{6,8})\b/i)?.[1];
+      let notice;
+      if (/there was a problem providing access to protected content/i.test(text)) {
+        notice = { reason: 'player reported a protected-content access error', code, blocked: true };
+      } else if (/\b(?:this )?domain is blocked\b|\berror:\s*forbidden\b|\baccess denied\b/i.test(text)) {
+        notice = { reason: 'player reported an access restriction', code, blocked: true };
+      } else if (/problem with your internet connection|live stream is either down or has ended|error loading media|\bstream unavailable\b|the video cannot be played in this browser/i.test(text) ||
+          (playerText && /\bplayback error\b/i.test(text))) {
+        notice = { reason: 'player reported a playback or connection error', code };
+      }
+      const playingVideos = [...document.querySelectorAll('video')]
+        .filter((video) => !video.paused && !video.ended).length;
+      return { player, notice, playingVideos };
+    }, selector).catch(() => null);
+    return { frame, ...observation };
+  }));
+  if (!page.browser().connected || page.isClosed()) throw new BotError('Chrome control was lost.');
+  const best = snapshots.reduce((a, b) => (b.player?.area ?? 0) > (a?.player.area ?? 0) ? b : a, null);
+  const mainNotice = snapshots.find((snapshot) => snapshot.frame === page.mainFrame())?.notice;
+  const notice = best?.notice || mainNotice || (!best && snapshots.find((snapshot) => snapshot.notice)?.notice);
+  return { notice, best, playing: snapshots.filter((snapshot) => snapshot.playingVideos) };
+}
+
+async function pauseExtraVideos(best, playing) {
+  if (!best || playing.reduce((count, snapshot) => count + snapshot.playingVideos, 0) <= Number(!best.player.paused && !best.player.ended)) return;
+  await Promise.all(playing.map(({ frame }) => frame.evaluate((keepId) => {
+    for (const video of document.querySelectorAll('video')) {
+      const id = window.streamVideoMonitor?.ids.get(video);
+      if (!video.paused && `${performance.timeOrigin}:${id}` !== keepId) video.pause();
+    }
+  }, frame === best.frame ? best.player.id : null).catch(() => {})));
+}
+
+function progressed(previous, next) {
+  return previous && next && previous.frame === next.frame && previous.player.id === next.player.id &&
+    next.player.advancing && (next.player.frames === null || next.player.frames > previous.player.frames) &&
+    next.player.time - previous.player.time >= 0.10;
+}
+
+async function controlPlayer({ frame, player }, selector, action) {
+  await frame.evaluate((css, id, control) => {
+    for (const el of document.querySelectorAll(css)) {
+      const identity = globalThis.streamVideoMonitor?.ids.get(el);
+      if (`${performance.timeOrigin}:${identity}` === id) {
+        if (control === 'play') {
+          const attempts = globalThis.streamVideoMonitor.play;
+          const previous = attempts.get(el);
+          if (previous?.inFlight || (previous && Date.now() - previous.at < 3_000)) break;
+          const attempt = { at: Date.now(), inFlight: true };
+          attempts.set(el, attempt);
+          void el.play().catch((error) => {
+            if (['NotAllowedError', 'NotSupportedError'].includes(error.name)) attempt.error = error.name;
+          }).finally(() => { attempt.inFlight = false; });
+        }
+        if (control === 'present') {
+          el.muted = false;
+          if (el.volume === 0) el.volume = 1;
+          if (document.fullscreenEnabled && !document.fullscreenElement) {
+            void el.requestFullscreen().catch(() => {});
+          }
+        }
+        break;
+      }
+    }
+  }, selector, player.id, action).catch(() => {});
+}
+
+async function pressPlay(page) {
   for (const frame of page.frames()) {
+    const button = await frame.$(PLAY_BUTTON).catch(() => null);
+    if (!button) continue;
     try {
-      if (frame.isDetached()) continue;
-      const result = await Promise.race([
-        frame.evaluate(() => {
-          const text = (document.body?.innerText || '').slice(0, 20000);
-          if (/there was a problem providing access to protected content|playback error[^\n]{0,100}protected content|drm license (?:denied|error|failed)/i.test(text)) {
-            return { type: 'PROTECTED_CONTENT' };
-          }
-          const events = window.__streamBotEvents || {};
-          const videos = [...document.querySelectorAll('video')]
-            .filter(v => v.clientWidth > 80 && v.clientHeight > 60)
-            .sort((a, b) => (b.clientWidth * b.clientHeight) - (a.clientWidth * a.clientHeight));
-          if (!videos.length) return { type: 'NO_VIDEO', encrypted: events.encrypted || events.waitingForKey };
-          const v = videos[0];
-          const quality = typeof v.getVideoPlaybackQuality === 'function' ? v.getVideoPlaybackQuality() : null;
-          return {
-            type: 'VIDEO',
-            time: Number(v.currentTime || 0),
-            frames: quality ? Number(quality.totalVideoFrames || 0) : null,
-            paused: v.paused,
-            ended: v.ended,
-            ready: v.readyState,
-            videoWidth: v.videoWidth,
-            videoHeight: v.videoHeight,
-            mediaError: v.error ? { code: v.error.code, message: v.error.message || '' } : null,
-            encrypted: !!(events.encrypted || events.waitingForKey || v.mediaKeys)
-          };
-        }),
-        sleep(3500).then(() => ({ type: 'FRAME_TIMEOUT' }))
-      ]);
-      if (result.type === 'PROTECTED_CONTENT') return result;
-      if (result.encrypted) encrypted = true;
-      if (result.type === 'VIDEO') {
-        if (!best || result.videoWidth * result.videoHeight > best.videoWidth * best.videoHeight) best = result;
+      if (await button.isVisible()) {
+        await button.click();
+        return;
       }
-    } catch {}
+    } catch {
+      // The player can replace the button as playback starts.
+    } finally {
+      await button.dispose().catch(() => {});
+    }
   }
-  return best || { type: 'NO_VIDEO', encrypted };
 }
 
-function progressed(previous, current) {
-  if (!previous || current.type !== 'VIDEO' || current.mediaError || current.ended || current.paused) return false;
-  if (current.ready < 2 || current.videoWidth < 2 || current.videoHeight < 2) return false;
-  const timeMoved = current.time > previous.time + 0.05;
-  if (current.frames !== null && previous.frames !== null && (current.frames > 0 || previous.frames > 0)) {
-    return current.frames > previous.frames;
+async function watchSource(page, source, config, showLive, signal, timings, network) {
+  let response;
+  network.reset();
+  try {
+    response = await page.goto(source.url, { waitUntil: 'domcontentloaded', timeout: timings.navigation });
+  } catch {
+    signal.throwIfAborted();
+    if (!page.browser().connected || page.isClosed()) throw new BotError('Chrome control was lost.');
+    const fault = network.lastFault();
+    return { reason: fault ? `navigation failed (${fault})` : 'navigation failed or timed out' };
   }
-  return timeMoved;
-}
 
-async function navigateAndWaitForVideo(targetUrl, serverSelection, deadline) {
-  log('[PLAYER] Loading authorized webpage (no playlist extraction).');
-  await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
-  await clickServerIfRequested(serverSelection);
-  const cutoff = Math.min(Date.now() + READY_TIMEOUT_MS, deadline);
-  let previous = null;
-  let consecutive = 0;
-  let lastPlayAttempt = 0;
-  let sawEncryption = false;
-  while (Date.now() < cutoff) {
-    if (Date.now() - lastPlayAttempt > 9000) {
-      await tryPlayFromPage();
-      lastPlayAttempt = Date.now();
-    }
-    const current = await samplePlayback();
-    if (current.type === 'PROTECTED_CONTENT') {
-      throw new Error('PROTECTED_CONTENT: Website reports a protected-content access failure. Check DRM, entitlement, and browser compatibility; no bypass attempted.');
-    }
-    if (current.type === 'BROWSER_CLOSED') throw new Error('Chrome disconnected.');
-    if (current.encrypted) sawEncryption = true;
-    if (current.type === 'VIDEO' && current.mediaError) {
-      log(`[PLAYER] Media error ${current.mediaError.code}: ${current.mediaError.message.slice(0, 150)}`);
-    }
-    if (progressed(previous, current)) consecutive++;
-    else consecutive = 0;
-    if (consecutive >= 2) {
-      log(`[PLAYER] Confirmed moving video (${current.videoWidth}x${current.videoHeight}, decoded frames progressing).`);
-      return current;
-    }
-    previous = current.type === 'VIDEO' ? current : null;
-    await sleep(POLL_MS);
-  }
-  const note = sawEncryption ? ' Encrypted-media/DRM activity was detected; check authorized license access.' : '';
-  throw new Error('VIDEO_NOT_READY: No verified advancing video within startup window.' + note);
-}
+  const status = response?.status();
+  if ([401, 403, 451].includes(status)) return { reason: `page returned HTTP ${status}`, blocked: true };
+  if (status >= 400) return { reason: `page returned HTTP ${status}` };
 
-async function monitorStream(targetUrl, serverSelection, deadline) {
-  let recoveries = 0;
-  let previous = null;
-  let lastProgress = Date.now();
-  let lastObsCheck = 0;
-  let lastHeartbeat = 0;
-  let continuousHealthyStart = Date.now();
+  const startupDeadline = performance.now() + timings.startup;
+  let choosingServer = Boolean(config.serverSelection);
+  let previous;
+  let presented;
+  let live = false;
+  let goodSamples = 0;
+  let nextPlayControl = 0;
+  let previousFailure;
+  let playedSince;
+  let lastAdvance = performance.now();
+  const outcome = (reason, blocked = false) => ({ live, reason, blocked, healthyMs: live ? lastAdvance - playedSince : 0 });
+  for (;;) {
+    signal.throwIfAborted();
+    const { best, notice, playing } = await inspectPlayer(page, config.videoSelector);
+    signal.throwIfAborted();
+    if (notice?.blocked) {
+      const detail = notice.code ? ` (player code ${notice.code})` : '';
+      return outcome(`${notice.reason}${detail}`, true);
+    }
+    if (choosingServer) {
+      await selectServer(page, config.serverSelection, signal, timings);
+      choosingServer = false;
+      continue;
+    }
 
-  while (Date.now() < deadline) {
-    const current = await samplePlayback();
-    if (current.type === 'PROTECTED_CONTENT') {
-      await stopBroadcast();
-      throw new Error('PROTECTED_CONTENT: Access to protected media failed. Broadcast stopped; automatic bypass/retry disabled.');
-    }
-    if (current.type === 'BROWSER_CLOSED') {
-      await stopBroadcast();
-      throw new Error('Chrome disconnected; no second browser will be launched.');
-    }
-    if (progressed(previous, current)) lastProgress = Date.now();
-    previous = current.type === 'VIDEO' ? current : null;
-
-    if (Date.now() - lastHeartbeat >= 30000) {
-      log(`[HEARTBEAT] ${current.type}; advancing=${Date.now() - lastProgress < FREEZE_MS}; ` +
-          `time=${current.type === 'VIDEO' ? current.time.toFixed(1) : 'n/a'}; recoveries=${recoveries}`);
-      lastHeartbeat = Date.now();
-    }
-    if (Date.now() - lastObsCheck >= 30000) {
-      const state = await obs.call('GetStreamStatus');
-      if (!state.outputActive && Date.now() - lastProgress < FREEZE_MS) {
-        log('[OBS] Output disconnected; restarting only because video is healthy.');
-        streaming = false;
-        await startBroadcast();
+    await pauseExtraVideos(best, playing);
+    const now = performance.now();
+    const player = best?.player;
+    if (progressed(previous, best)) {
+      lastAdvance = now;
+      goodSamples++;
+      previousFailure = undefined;
+    } else {
+      goodSamples = 0;
+      const reported = notice && `${notice.reason}${notice.code ? ` (player code ${notice.code})` : ''}`;
+      const failure = player?.ended ? 'video ended' : mediaErrors[player?.error] || reported;
+      if (failure && failure === previousFailure && !player?.waitingForKey) return outcome(failure);
+      previousFailure = failure;
+      if (player?.paused && player.ready && !player.ended && !player.error) {
+        await controlPlayer(best, config.videoSelector, 'play');
       }
-      lastObsCheck = Date.now();
+      if (!live && !player?.advancing && !player?.waitingForKey && now >= nextPlayControl) {
+        nextPlayControl = now + 3_000;
+        await pressPlay(page);
+      }
     }
-    if (Date.now() - continuousHealthyStart > 5 * 60 * 1000) {
-      recoveries = 0; // Reset fault counter after a sustained healthy period.
-      continuousHealthyStart = Date.now();
+    previous = best;
+
+    if (goodSamples >= 2 && (presented?.frame !== best?.frame || presented?.player.id !== player?.id)) {
+      await controlPlayer(best, config.videoSelector, 'present');
+      signal.throwIfAborted();
+      presented = best;
     }
-    if (Date.now() - lastProgress >= FREEZE_MS) {
-      recoveries++;
-      continuousHealthyStart = Date.now();
-      log(`[RECOVERY] Playback stalled for ${FREEZE_MS / 1000}s. Same URL, recovery ${recoveries}/${MAX_RECOVERIES}.`);
-      await stopBroadcast(); // Never knowingly broadcast a frozen image.
-      if (recoveries > MAX_RECOVERIES) throw new Error('Maximum same-URL recovery attempts exceeded.');
-      await sleep(Math.min(3000 * recoveries, 12000));
-      const verified = await navigateAndWaitForVideo(targetUrl, serverSelection, deadline);
-      await startBroadcast();
-      previous = verified;
-      lastProgress = Date.now();
-      lastObsCheck = Date.now();
+    if (!live && goodSamples >= 2) {
+      await showLive(true);
+      console.log(`[Source ${source.number}] Playing. OBS is on the live scene.`);
+      playedSince = now;
+      live = true;
     }
-    await sleep(POLL_MS);
+    if ((!live && now >= startupDeadline) || (live && now - lastAdvance >= source.stallMs)) {
+      if (player?.waitingForKey) return outcome('protected playback did not resume while waiting for a key', true);
+      const detail = player?.playError === 'NotAllowedError' ? 'browser denied autoplay' :
+        player?.playError === 'NotSupportedError' ? 'unsupported video source or codec' :
+        player ? 'video did not advance' : 'no matching visible video';
+      const fault = network.lastFault();
+      const extra = [player?.encrypted && 'encrypted media observed', fault && `network: ${fault}`].filter(Boolean);
+      const message = live ? 'video stalled' : `startup timed out (${detail})`;
+      return outcome(extra.length ? `${message}; ${extra.join(', ')}` : message);
+    }
+    await delay(timings.poll, undefined, { signal });
   }
-  log('[DONE] Requested duration completed.');
 }
 
-async function cleanup() {
-  if (shuttingDown) return;
-  shuttingDown = true;
-  await stopBroadcast();
-  if (browser) { try { await browser.close(); } catch {} browser = null; }
-  if (obsConnected) { try { await obs.disconnect(); } catch {} obsConnected = false; }
-  if (obsProcess && obsProcess.exitCode === null) {
-    obsProcess.kill('SIGTERM');
-    const child = obsProcess;
-    setTimeout(() => { if (child.exitCode === null) child.kill('SIGKILL'); }, 3000).unref();
+async function runSources({ page, config, showLive, showStatus = async () => {}, signal, timings = timing }) {
+  const skipped = new Set();
+  let cooldown = timings.cooldown;
+  let failedPasses = 0;
+  const valid = await page.evaluate((css) => {
+    try {
+      document.querySelector(css);
+      return true;
+    } catch {
+      return false;
+    }
+  }, config.videoSelector);
+  if (!valid) throw new BotError('VIDEO_SELECTOR must be a valid CSS selector.');
+  const network = await installPlaybackDiagnostics(page);
+
+  for (;;) {
+    for (const source of config.sources) {
+      if (skipped.has(source.number)) continue;
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        signal.throwIfAborted();
+        await showStatus(attempt === 1 ? `Loading source ${source.number}` : `Recovering source ${source.number}`);
+        console.log(`[Source ${source.number}] Checking playback (attempt ${attempt}/2).`);
+        const outcome = await watchSource(page, source, config, showLive, signal, timings, network);
+        if (outcome.live) {
+          await showStatus(`Recovering source ${source.number}`);
+          await showLive(false);
+        }
+        await page.goto('about:blank', { waitUntil: 'domcontentloaded', timeout: timings.navigation })
+          .catch(() => { throw new BotError('The failed page could not be cleared.'); });
+        console.warn(`[Source ${source.number}] ${outcome.reason}${outcome.blocked ? '. Skipping for this run' : ''}.`);
+        if (outcome.healthyMs >= 60_000) {
+          failedPasses = 0;
+          cooldown = timings.cooldown;
+        }
+        if (outcome.blocked) {
+          skipped.add(source.number);
+          break;
+        }
+        if (attempt === 1) await delay(timings.poll, undefined, { signal });
+      }
+    }
+
+    if (skipped.size === config.sources.length) throw new BotError('All configured sources reported access errors.');
+    if (++failedPasses >= 3) throw new BotError('Playback could not be sustained after three source-list passes.');
+    await showStatus('Waiting to retry playback');
+    console.log(`End of source list. Retrying in ${Math.round(cooldown / 1000)} seconds.`);
+    await delay(cooldown, undefined, { signal });
+    cooldown = Math.min(cooldown * 2, 120_000);
   }
 }
 
 async function main() {
-  const cfg = readConfig();
-  const deadline = Date.now() + cfg.durationMs;
-  log(`[CONFIG] Channel=${cfg.channel}; URL host=${cfg.safeHost}; ` +
-      `Quality=${width}x${height}@30fps; duration=${Math.round(cfg.durationMs / 60000)}m; Chrome=1; URL=1`);
-  await launchObs();
-  await configureObs(cfg.key);
-  await launchSingleChrome();
-  await navigateAndWaitForVideo(cfg.targetUrl, cfg.serverSelection, deadline);
-  await startBroadcast();
-  await monitorStream(cfg.targetUrl, cfg.serverSelection, deadline);
+  const config = readSettings(process.env);
+  delete process.env.STREAM_KEY;
+  delete process.env.STREAM_INGEST_URL;
+  delete process.env.TARGET_URLS;
+  if (!process.env.DISPLAY) throw new BotError('An X11 display is required. Run inside Xvfb.');
+  const stop = new AbortController();
+  const requestStop = () => stop.abort();
+  process.once('SIGINT', requestStop);
+  process.once('SIGTERM', requestStop);
+  const timer = config.durationMs ? setTimeout(requestStop, config.durationMs) : undefined;
+  let obs;
+  let browser;
+  let infrastructureError;
+  const fail = (error) => {
+    if (!stop.signal.aborted) infrastructureError = error;
+    stop.abort();
+  };
+
+  try {
+    obs = await createObs({ ...config, signal: stop.signal });
+    obs.failure.catch(fail);
+    stop.signal.throwIfAborted();
+    browser = await puppeteer.launch({
+      executablePath: process.env.CHROME_PATH || '/usr/bin/google-chrome',
+      headless: false,
+      defaultViewport: null,
+      handleSIGINT: false,
+      handleSIGTERM: false,
+      handleSIGHUP: false,
+      ignoreDefaultArgs: ['--disable-popup-blocking', '--disable-component-update'],
+      protocolTimeout: 8_000,
+      args: ['--kiosk', '--window-position=0,0', '--window-size=1920,1080',
+        '--autoplay-policy=no-user-gesture-required', '--no-first-run'],
+    }).catch(() => { throw new BotError('Chrome did not start. Check CHROME_PATH and the runner’s Chrome sandbox.'); });
+    browser.once('disconnected', () => fail(new BotError('Chrome disconnected.')));
+    stop.signal.throwIfAborted();
+    const [page, ...extraPages] = await browser.pages();
+    if (!page) throw new BotError('Chrome started without a player tab.');
+    await Promise.all(extraPages.map((extra) => extra.close()));
+    page.on('popup', (popup) => { void popup.close().catch(() => {}); });
+    page.on('dialog', (dialog) => { void dialog.dismiss().catch(() => {}); });
+    page.once('error', () => fail(new BotError('The Chrome player tab crashed.')));
+    await page.bringToFront();
+    await runSources({ page, config, showLive: obs.showLive, showStatus: obs.showStatus, signal: stop.signal });
+  } catch (error) {
+    if (infrastructureError) throw infrastructureError;
+    if (!stop.signal.aborted) throw error;
+  } finally {
+    stop.abort();
+    clearTimeout(timer);
+    try {
+      await obs?.close();
+    } finally {
+      await browser?.close().catch(() => {});
+    }
+    process.off('SIGINT', requestStop);
+    process.off('SIGTERM', requestStop);
+  }
 }
 
-process.once('SIGINT', () => { cleanup().finally(() => process.exit(130)); });
-process.once('SIGTERM', () => { cleanup().finally(() => process.exit(143)); });
-process.on('unhandledRejection', err => { log('[FATAL] Unhandled rejection:', err); cleanup().finally(() => process.exit(1)); });
-main().then(() => cleanup()).catch(async err => {
-  log('[FATAL]', err.message);
-  await cleanup();
-  process.exitCode = 1;
-});
+const COLLECTION = 'Stream Bot';
+const CONFIG_NAME = 'StreamBot';
+const WAITING = 'Waiting';
+const LIVE = 'Live';
+const WAITING_TEXT = 'Stream Status';
+const BASE_WIDTH = 1920;
+const BASE_HEIGHT = 1080;
+
+class ObsError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'ObsError';
+  }
+}
+
+function allocatePort() {
+  return new Promise((resolve, reject) => {
+    const server = createServer();
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const { port } = server.address();
+      server.close((error) => error ? reject(error) : resolve(port));
+    });
+  });
+}
+
+async function within(promise, ms, message) {
+  let timer;
+  try {
+    return await Promise.race([promise, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), ms);
+    })]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function writeConfig(root, { width, height, bitrate, ingestUrl, streamKey }, port, password) {
+  const obsRoot = join(root, 'obs-studio');
+  const profileDir = join(obsRoot, 'basic', 'profiles', CONFIG_NAME);
+  const sceneDir = join(obsRoot, 'basic', 'scenes');
+  const websocketDir = join(obsRoot, 'plugin_config', 'obs-websocket');
+  await Promise.all([profileDir, sceneDir, websocketDir].map((directory) => mkdir(directory, { recursive: true })));
+
+  const frontendIni = `[General]\nLanguage=en-US\nFirstRun=true\n` +
+    `[Basic]\nProfile=${COLLECTION}\nProfileDir=${CONFIG_NAME}\nSceneCollection=${COLLECTION}\nSceneCollectionFile=${CONFIG_NAME}\n` +
+    '[BasicWindow]\nPreviewEnabled=false\n';
+  const websocketIni = '[OBSWebSocket]\nFirstLoad=false\nServerEnabled=true\nAuthRequired=true\n' +
+    `AlertsEnabled=false\nServerPort=${port}\nServerPassword=${password}\n`;
+  const websocketConfig = {
+    first_load: false, server_enabled: true, auth_required: true,
+    alerts_enabled: false, server_port: port, server_password: password,
+  };
+  const profileIni = `[General]\nName=${COLLECTION}\n[Output]\nMode=Simple\n` +
+    `[Video]\nBaseCX=${BASE_WIDTH}\nBaseCY=${BASE_HEIGHT}\nOutputCX=${width}\nOutputCY=${height}\nFPSCommon=30\n` +
+    `[SimpleOutput]\nVBitrate=${bitrate}\nABitrate=160\nStreamEncoder=x264\nPreset=veryfast\nUseAdvanced=true\nx264Settings=keyint=60\n`;
+  const service = { type: 'rtmp_custom', settings: { server: ingestUrl, key: streamKey } };
+  const collection = {
+    name: COLLECTION,
+    current_scene: WAITING,
+    current_program_scene: WAITING,
+    scene_order: [{ name: WAITING }],
+    sources: [{ name: WAITING, id: 'scene', versioned_id: 'scene', settings: { items: [] } }],
+    current_transition: 'Cut',
+  };
+  const privateFile = { mode: 0o600 };
+  await Promise.all([
+    writeFile(join(obsRoot, 'global.ini'), frontendIni + websocketIni, privateFile),
+    writeFile(join(obsRoot, 'user.ini'), frontendIni, privateFile),
+    writeFile(join(websocketDir, 'config.json'), JSON.stringify(websocketConfig), privateFile),
+    writeFile(join(profileDir, 'basic.ini'), profileIni, privateFile),
+    writeFile(join(profileDir, 'service.json'), JSON.stringify(service), privateFile),
+    writeFile(join(sceneDir, `${CONFIG_NAME}.json`), JSON.stringify(collection), privateFile),
+  ]);
+}
+
+async function createObs({ width, height, bitrate, ingestUrl, streamKey, signal }) {
+  if (!process.env.DISPLAY || !process.env.PULSE_SINK) {
+    throw new ObsError('OBS requires a dedicated X11 DISPLAY and PulseAudio PULSE_SINK.');
+  }
+
+  signal?.throwIfAborted();
+  const root = await mkdtemp(join(tmpdir(), 'stream-obs-'));
+  const obs = new OBSWebSocket();
+  const lifetime = new AbortController();
+  const startupSignal = signal ? AbortSignal.any([signal, lifetime.signal]) : lifetime.signal;
+  let child;
+  let childClosed;
+  let startup;
+  let closePromise;
+  let streamRequested = false;
+  let outputStartup;
+  let readyOutput;
+  let sceneChange = Promise.resolve();
+  let canShowStatus = false;
+  let rejectFailure;
+  const failure = new Promise((_, reject) => { rejectFailure = reject; });
+  failure.catch(() => {});
+
+  function fail(message) {
+    if (!closePromise) rejectFailure(new ObsError(message));
+  }
+
+  async function call(name, data) {
+    try {
+      return await within(obs.call(name, data), 5000, 'OBS request timed out.');
+    } catch (error) {
+      const code = Number.isInteger(error.code) ? ` (code ${error.code})` : '';
+      throw new ObsError(`OBS ${name} failed${code}.`);
+    }
+  }
+
+  async function cleanup() {
+    lifetime.abort();
+    if (obs.identified && streamRequested) await call('StopStream').catch(() => {});
+    await within(obs.disconnect(), 2000, 'OBS disconnect timed out.').catch(() => {});
+    if (child?.pid && child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGTERM');
+      try {
+        await within(childClosed, 5000, 'OBS shutdown timed out.');
+      } catch {
+        child.kill('SIGKILL');
+        await childClosed;
+      }
+    }
+    await startup?.catch(() => {});
+    await outputStartup?.catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+
+  function close() {
+    closePromise ??= Promise.resolve().then(cleanup);
+    return closePromise;
+  }
+
+  async function startOutput() {
+    startupSignal.throwIfAborted();
+    streamRequested = true;
+    try {
+      await call('StartStream');
+    } catch (error) {
+      throw new ObsError(`${error.message} Check the ingest address and selected channel key.`);
+    }
+
+    const deadline = performance.now() + 25000;
+    do {
+      startupSignal.throwIfAborted();
+      const status = await call('GetStreamStatus');
+      if (status.outputActive && !status.outputReconnecting && status.outputBytes > 0) {
+        console.log('[OBS] Broadcast started and ingest bytes confirmed.');
+        return;
+      }
+      await delay(500, undefined, { signal: startupSignal });
+    } while (performance.now() < deadline);
+    throw new ObsError('OBS did not confirm bytes sent to the ingest destination. Check the ingest address and selected channel key.');
+  }
+
+  function showLive(live) {
+    const change = sceneChange.then(async () => {
+      startupSignal.throwIfAborted();
+      await call('SetCurrentProgramScene', { sceneName: live ? LIVE : WAITING });
+      if (live) {
+        if (!outputStartup) {
+          outputStartup = startOutput();
+          readyOutput = Promise.race([outputStartup, failure]);
+        }
+        await readyOutput;
+      }
+    });
+    sceneChange = change.catch(() => {});
+    return change;
+  }
+
+  async function showStatus(message) {
+    if (!canShowStatus) return;
+    startupSignal.throwIfAborted();
+    await call('SetInputSettings', {
+      inputName: WAITING_TEXT,
+      inputSettings: { text: message },
+      overlay: true,
+    });
+  }
+
+  async function start(port, password) {
+    const env = { ...process.env, XDG_CONFIG_HOME: root, QT_QPA_PLATFORM: 'xcb' };
+    delete env.STREAM_KEY;
+    delete env.STREAM_INGEST_URL;
+    delete env.TARGET_URLS;
+    delete env.STREAM_KEYS_FILE;
+    child = spawn('obs', [
+      '--multi', '--minimize-to-tray', '--disable-missing-files-check',
+      '--profile', COLLECTION, '--collection', COLLECTION,
+    ], { env, stdio: 'ignore' });
+    childClosed = new Promise((resolve) => child.once('close', resolve));
+    child.once('error', () => fail('OBS could not start. Install OBS Studio with obs-websocket v5 on the runner.'));
+    child.once('exit', (code, reason) => fail(`OBS exited unexpectedly (${reason ?? code}).`));
+
+    const connectionDeadline = performance.now() + 30000;
+    while (true) {
+      startupSignal.throwIfAborted();
+      try {
+        await within(obs.connect(`ws://127.0.0.1:${port}`, password, { rpcVersion: 1 }), 5000, 'OBS connection timed out.');
+        await call('GetVersion');
+        break;
+      } catch {
+        await within(obs.disconnect(), 2000, 'OBS disconnect timed out.').catch(() => {});
+        if (performance.now() >= connectionDeadline) throw new ObsError('OBS WebSocket did not become ready. Check that OBS starts on the Xvfb display.');
+        await delay(400, undefined, { signal: startupSignal });
+      }
+    }
+
+    obs.on('ConnectionClosed', () => fail('OBS WebSocket connection closed unexpectedly.'));
+    obs.on('StreamStateChanged', ({ outputState }) => {
+      if (streamRequested && outputState === 'OBS_WEBSOCKET_OUTPUT_STOPPED') fail('OBS stream output stopped. Check the destination and selected channel key.');
+    });
+
+    const settings = await call('GetVideoSettings');
+    if (settings.baseWidth !== BASE_WIDTH || settings.baseHeight !== BASE_HEIGHT ||
+        settings.outputWidth !== width || settings.outputHeight !== height) {
+      throw new ObsError('OBS started with unexpected video settings. Check the selected profile.');
+    }
+
+    const { inputKinds } = await call('GetInputKindList');
+    const displayKind = inputKinds.includes('xshm_input_v2') ? 'xshm_input_v2' : 'xshm_input';
+    if (!inputKinds.includes(displayKind) || !inputKinds.includes('pulse_output_capture')) {
+      throw new ObsError('OBS must include the Linux XSHM and PulseAudio capture plugins.');
+    }
+
+    const textKind = inputKinds.find((kind) => kind === 'text_ft2_source_v2') ||
+      inputKinds.find((kind) => kind === 'text_ft2_source');
+    if (textKind) {
+      const { sceneItemId } = await call('CreateInput', {
+        sceneName: WAITING, inputName: WAITING_TEXT, inputKind: textKind, sceneItemEnabled: true,
+        inputSettings: {
+          text: 'Waiting for playback',
+          font: { face: 'DejaVu Sans', style: 'Bold', size: 64 },
+        },
+      });
+      await call('SetSceneItemTransform', {
+        sceneName: WAITING, sceneItemId,
+        sceneItemTransform: { positionX: BASE_WIDTH / 2, positionY: BASE_HEIGHT / 2, alignment: 0 },
+      });
+      canShowStatus = true;
+    } else {
+      console.warn('[OBS] Linux FreeType text source unavailable. The waiting scene will be blank.');
+    }
+
+    await call('CreateScene', { sceneName: LIVE });
+    await call('CreateInput', {
+      sceneName: LIVE, inputName: 'Chrome Display', inputKind: displayKind,
+      inputSettings: { screen: 0, show_cursor: false }, sceneItemEnabled: true,
+    });
+    await call('CreateInput', {
+      sceneName: LIVE, inputName: 'Chrome Audio', inputKind: 'pulse_output_capture',
+      inputSettings: { device_id: `${process.env.PULSE_SINK}.monitor` }, sceneItemEnabled: true,
+    });
+    await call('SetCurrentSceneTransition', { transitionName: 'Cut' });
+    await showLive(false);
+    console.log('[OBS] Ready. Waiting for verified playback.');
+  }
+
+  try {
+    const port = await allocatePort();
+    const password = randomBytes(24).toString('hex');
+    await writeConfig(root, { width, height, bitrate, ingestUrl, streamKey }, port, password);
+    startupSignal.throwIfAborted();
+    startup = start(port, password);
+    await Promise.race([startup, failure]);
+    return { showLive, showStatus, close, failure };
+  } catch (error) {
+    await close();
+    throw error;
+  }
+}
+
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(error instanceof BotError || error.name === 'ObsError' ? error.message : 'The stream bot stopped because of an unexpected error.');
+    process.exitCode = 1;
+  });
+}
+
+module.exports = { readSettings, runSources };
